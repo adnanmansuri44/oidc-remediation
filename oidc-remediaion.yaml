@@ -1,32 +1,10 @@
 AWSTemplateFormatVersion: 2010-09-09
-Description: Rules and function for CIS alarms automation
-Parameters:
-  StackSetArn:
-    Type: String
-    Description: ARN of the CIS Alarms StackSet deployed from Control Tower Master account (ct_vpc_flowlog_master_stack.yml)
-
-Mappings: 
-  SourceCode:
-    Key:
-      LifeCycle: "ct_flowlog_lifecycle.zip"
-  S3perRegion:
-    us-east-1:
-      NAME: marketplace-sa-resources-ct-us-east-1
-    us-east-2:
-      NAME: marketplace-sa-resources-ct-us-east-2
-    us-west-2:
-      NAME: marketplace-sa-resources-ct-us-west-2
-    eu-west-1:
-      NAME: marketplace-sa-resources-ct-eu-west-1
-    ap-southeast-2:
-      NAME: marketplace-sa-resources-ct-ap-southeast-2
-
-
+Description: Rules and function for oidc remediaion automation
 Resources:
-  CISAlarmsLifecycleRole:
+  oidcremediaionRole:
     Type: AWS::IAM::Role
     Properties:
-      Description: CIS Alarms - Role used by lambda for life cycle / new account creation
+      Description: OIDC-Remediaion - Role used by lambda for Remediating unknown OIDC creation
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -39,16 +17,16 @@ Resources:
               - "sts:AssumeRole"
       Path: "/"
       Policies:
-      - PolicyName: StackSetPolicy
+      - PolicyName: oidcremediaion
         PolicyDocument:
           Version: 2012-10-17
           Statement:
           - Effect: Allow
             Action:
-              - cloudformation:ListStackInstances
-              - cloudformation:CreateStackInstances
-            Resource:
-              -  !Ref StackSetArn
+              - iam:DeleteOpenIDConnectProvider
+              - eks:ListClusters
+              - eks:DescribeCluster
+            Resource: "*"
           - Effect: Allow
             Action:
               - logs:CreateLogGroup
@@ -56,54 +34,132 @@ Resources:
               - logs:PutLogEvents
             Resource:
               -  !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
-
-  CISAlarmsLifeCycle:
+  oidcremediaion:
     Type: "AWS::Lambda::Function"
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-CISAlarmsLifeCycle
-      Description: FlowLog - Function to handle Control Tower LifeCycle
-      Handler: "ct_flowlog_lifecycle.lambda_handler"
-      Role: !GetAtt CISAlarmsLifecycleRole.Arn
+      FunctionName: OIDCRemediaion
+      Description: Function to Clean unknown OIDC Identity provider
+      Handler: "oidc_remediaion.lambda_handler"
+      Role: !GetAtt oidcremediaionRole.Arn
       Code:
-        S3Bucket: !FindInMap [ S3perRegion, !Ref "AWS::Region", NAME ]
-        S3Key: !Join ["/", [!FindInMap ["SourceCode", "Key", "LifeCycle"]]]
-      Runtime: "python3.7"
+        ZipFile: !Sub |
+            """Remediate OIDC Providers."""
+            import json
+            import boto3
+            import logging
+            import os
+            from botocore.exceptions import ClientError
+            
+            LOGGER = logging.getLogger()
+            LOGGER.setLevel(logging.INFO)
+            IAM_CLIENT = boto3.client("iam", region_name='us-east-1')
+            
+            # Rules:
+            # - allow creation of OIDC provider only if the url matches an eks oidc provider url in this region
+            # - allow creation of OIDC provider only if the oidc provider url matches an existing EKS cluster in this account
+            # - else, deny
+            
+            def main(event):
+                """Start Function."""
+                oidc_url = event["detail"]["requestParameters"]["url"]
+                oidc_arn = event["detail"]["responseElements"]["openIDConnectProviderArn"]
+                TARGET_REGION = oidc_url.split(".")[2]
+                print(TARGET_REGION)
+                global EKS_CLIENT
+                EKS_CLIENT = boto3.client("eks", region_name=TARGET_REGION)
+                
+                try:
+                    # Checks:
+                    #   1. Verify the domain is an EKS OIDC domain in the target region
+                    #   2. Verify the domain is associated with an EKS cluster in this account/region
+                    # If either check fails, delete the OIDC Provider
+                    if not oidc_url.startswith(('https://oidc.eks.','.amazonaws.com'),0,45):
+                        IAM_CLIENT.delete_open_id_connect_provider(
+                            OpenIDConnectProviderArn=oidc_arn,
+                        )
+                        LOGGER.info(f'Deleted {oidc_arn}, due to invalid OIDC Provider URL: {oidc_url}')
+                        return None
+                    if not is_for_valid_cluster(oidc_url):
+                        IAM_CLIENT.delete_open_id_connect_provider(
+                            OpenIDConnectProviderArn=oidc_arn,
+                        )
+                        LOGGER.info(f'Deleted {oidc_arn}, due to invalid cluster (not in this account)')
+                    else:
+                        LOGGER.info(f'OIDC Provider {oidc_arn} is allowed')
+                except ClientError as e:
+                    LOGGER.critical(e)
+                    raise
+            
+            def is_for_valid_cluster(oidc_url: str):
+                LOGGER.info(f'Checking for a cluster which matches {oidc_url}')
+                cluster_names = get_cluster_names()
+                LOGGER.info(f'Checking clusters: {cluster_names}...')
+                for cluster_name in cluster_names:
+                    LOGGER.info(f'Checking cluster {cluster_name}...')
+                    cluster_details = EKS_CLIENT.describe_cluster(
+                        name = cluster_name,
+                    )
+                    LOGGER.info(f'Cluster details: {cluster_details}')
+                    oidc_issuer = cluster_details['cluster']['identity']['oidc']['issuer']
+                    if oidc_issuer == oidc_url:
+                        LOGGER.info(f'Cluster {cluster_name} matches {oidc_url}')
+                        return True
+                else:
+                    # If we reach the end of loop and never find a match,
+                    # this is not a valid cluster.
+                return False
+            
+            def get_cluster_names():
+                cluster_names = []
+                paginator = EKS_CLIENT.get_paginator('list_clusters')
+                for page in paginator.paginate():
+                    cluster_names += page['clusters']
+                return cluster_names
+            
+            def lambda_handler(event, context):
+                """Handle Event."""
+                LOGGER.info(event)
+                main(event)
+                
+                return {
+                    'statusCode': 200,
+                    'body': json.dumps('OK')
+                }
+      Runtime: "python3.9"
       MemorySize: 128
       Timeout: 300
-      Environment:
-        Variables:
-            stack_set_arn: !Ref StackSetArn
 
-  CreateAccountLifeCycleRule:
+  CreateOIDCidentityRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: FlowLog - CT Life Cycle for CreateManageAccount
+      Name: Oidc-create
+      Description: OIDC creation event rule
       EventPattern:
         {
           "source": [
-            "aws.controltower"
+            "aws.iam"
           ],
           "detail-type": [
-            "AWS Service Event via CloudTrail"
+            "AWS API Call via CloudTrail"
           ],
           "detail": {
             "eventSource": [
-              "controltower.amazonaws.com"
+              "iam.amazonaws.com"
             ],
             "eventName": [
-              "CreateManagedAccount"
+              "CreateOpenIDConnectProvider"
             ]
           }
         }
       State: ENABLED
       Targets:
-      - Arn: !GetAtt CISAlarmsLifeCycle.Arn
-        Id: "OrganizationalUnitLifeCycle"
+      - Arn: !GetAtt oidcremediaion.Arn
+        Id: "OIDCRemediaionV1"
 
-  CreateAccountLifeCycleRulePermission:
+  oidcremediaionRulePermission:
     Type: AWS::Lambda::Permission
     Properties:
-      FunctionName: !GetAtt CISAlarmsLifeCycle.Arn
+      FunctionName: !GetAtt oidcremediaion.Arn
       Action: "lambda:InvokeFunction"
       Principal: "events.amazonaws.com"
-      SourceArn: !GetAtt CreateAccountLifeCycleRule.Arn
+      SourceArn: !GetAtt CreateOIDCidentityRule.Arn
