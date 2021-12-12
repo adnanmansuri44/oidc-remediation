@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: 2010-09-09
-Description: Rules and function for oidc remediaion automation
+Description: Rules and function for oidc remediaion automation. this is test by codepipeline.
 Resources:
   oidcremediaionRole:
     Type: AWS::IAM::Role
@@ -58,6 +58,7 @@ Resources:
             # - allow creation of OIDC provider only if the url matches an eks oidc provider url in this region
             # - allow creation of OIDC provider only if the oidc provider url matches an existing EKS cluster in this account
             # - else, deny
+            # - this is test by codepipeline.
             
             def main(event):
                 """Start Function."""
